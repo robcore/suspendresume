@@ -292,6 +292,17 @@ class SystemValues:
 		return False
 	def basicKprobe(self, name):
 		self.kprobes[name] = {'name': name,'func': name,'args': dict(),'format': name,'mask': name}
+	def kprobeRetval(self, retline):
+		out = ''
+		retval = ''
+		m = re.match('.* arg1=(?P<ret>.*)', retline)
+		if m:
+			retval = m.group('ret')
+		m = re.match('\((?P<par>.*) <- .*\).*', retline)
+		if m:
+			out += 'caller:%s;' % m.group('par')
+		out += 'retval:%s;' % retval
+		return out
 	def kprobeColor(self, name):
 		if name not in self.kprobes or 'color' not in self.kprobes[name]:
 			return ''
@@ -321,9 +332,12 @@ class SystemValues:
 				m = re.match('.* '+arg+'=(?P<arg>.*)', data);
 				if m:
 					arglist[arg] = m.group('arg')
+		info = 'function:%s;' % (self.kprobes[name]['func'])
+		for arg in arglist:
+			info += arg+':'+arglist[arg]+';'
 		out = fmt.format(**arglist)
 		out = out.replace(' ', '_').replace('"', '')
-		return out
+		return out, info
 	def kprobeText(self, kprobe):
 		name, fmt, func, args = kprobe['name'], kprobe['format'], kprobe['func'], kprobe['args']
 		if re.findall('{(?P<n>[a-z,A-Z,0-9]*)}', func):
@@ -452,7 +466,6 @@ class DevProps:
 	syspath = ''
 	altname = ''
 	async = True
-	xtraclass = ''
 	xtrainfo = ''
 	def out(self, dev):
 		return '%s,%s,%d;' % (dev, self.altname, self.async)
@@ -463,17 +476,13 @@ class DevProps:
 			return dev
 		return '%s [%s]' % (self.altname, dev)
 	def xtraClass(self):
-		if self.xtraclass:
-			return ' '+self.xtraclass
 		if not self.async:
 			return ' sync'
 		return ''
 	def xtraInfo(self):
-		if self.xtraclass:
-			return ' '+self.xtraclass
-		if self.async:
-			return ' async'
-		return ' sync'
+		if not self.xtrainfo:
+			return 'async:%d;' % self.async
+		return self.xtrainfo
 
 # Class: DeviceNode
 # Description:
@@ -804,9 +813,9 @@ class Data:
 			htmlclass = ' bg'
 			self.phaseOverlap(phases)
 		if targetphase in self.phases:
-			self.newAction(targetphase, name, pid, '', start, end, '', htmlclass, color)
-			return targetphase
-		return False
+			name = self.newAction(targetphase, name, pid, '', start, end, '', htmlclass, color)
+			return targetphase, name
+		return '', ''
 	def newAction(self, phase, name, pid, parent, start, end, drv, htmlclass='', color=''):
 		# new device callback for a specific phase
 		self.html_device_id += 1
@@ -827,6 +836,7 @@ class Data:
 			list[name]['htmlclass'] = htmlclass
 		if color:
 			list[name]['color'] = color
+		return name
 	def deviceIDs(self, devlist, phase):
 		idlist = []
 		list = self.dmesg[phase]['list']
@@ -1231,8 +1241,8 @@ class FTraceCallGraph:
 			if name == base and 'ftrace' not in list[devname]:
 				list[devname]['ftrace'] = self
 				return
-		phase = data.newActionGlobal(name, fs, fe, -2)
-		if phase:
+		phase, name = data.newActionGlobal(name, fs, fe, -2)
+		if phase and name:
 			data.dmesg[phase]['list'][name]['ftrace'] = self
 	def debugPrint(self, filename):
 		if(filename == 'stdout'):
@@ -1970,12 +1980,18 @@ def parseTraceLog():
 		# kprobe event processing
 		elif(t.fkprobe):
 			if(t.fcall):
-				name = sysvals.kprobeValue(t.type, t.name)
+				name, info = sysvals.kprobeValue(t.type, t.name)
 				if not name:
 					continue
 				if(name not in tp.ktemp):
 					tp.ktemp[name] = []
-				tp.ktemp[name].append({'pid': pid, 'begin': t.time, 'end': t.time, 'type': t.type})
+				tp.ktemp[name].append({
+					'pid': pid, 
+					'begin': t.time, 
+					'end': t.time, 
+					'type': t.type,
+					'info': info
+				})
 			elif(t.freturn):
 				kname = ''
 				kstart = 0.0
@@ -1993,6 +2009,7 @@ def parseTraceLog():
 						tp.ktemp[name].pop()
 					else:
 						e['end'] = t.time
+						e['info'] += sysvals.kprobeRetval(t.name)
 		# callgraph processing
 		elif sysvals.usecallgraph:
 			# create a callgraph object for the data
@@ -2019,7 +2036,10 @@ def parseTraceLog():
 					kb, ke = e['begin'], e['end']
 					if test.data.isInsideTimeline(kb, ke):
 						color = sysvals.kprobeColor(e['type'])
-						test.data.newActionGlobal(name, kb, ke, pid, color)
+						p, n = test.data.newActionGlobal(name, kb, ke, pid, color)
+						if p and n:
+							sysvals.devprops[n] = DevProps()
+							sysvals.devprops[n].xtrainfo = e['info']
 		# add the callgraph data to the device hierarchy
 		for pid in test.ftemp:
 			for cg in test.ftemp[pid]:
@@ -2621,7 +2641,7 @@ def createHTML(testruns):
 	html_devlist2 = '<button id="devlist2" class="devlist" style="float:right;">Device Detail2</button>\n'
 	html_timeline = '<div id="dmesgzoombox" class="zoombox">\n<div id="{0}" class="timeline" style="height:{1}px">\n'
 	html_tblock = '<div id="block{0}" class="tblock" style="left:{1}%;width:{2}%;">\n'
-	html_device = '<div id="{0}" title="{1}" class="thread{7}" style="left:{2}%;top:{3}px;height:{4}px;width:{5}%;{8}">{6}</div>\n'
+	html_device = '<div id="{0}" title="{1}" class="thread{7}" style="left:{2}%;top:{3}px;height:{4}px;width:{5}%;{8}"{9}>{6}</div>\n'
 	html_traceevent = '<div title="{0}" class="traceevent" style="left:{1}%;top:{2}%;height:{3}%;width:{4}%;border:1px solid {5};background-color:{5}">{6}</div>\n'
 	html_phase = '<div class="phase" style="left:{0}%;width:{1}%;top:{2}px;height:{3}px;background-color:{4}">{5}</div>\n'
 	html_phaselet = '<div id="{0}" class="phaselet" style="left:{1}%;width:{2}%;background-color:{3}"></div>\n'
@@ -2741,7 +2761,7 @@ def createHTML(testruns):
 			width = '%f' % ((mTotal*100.0)/tTotal)
 			title = 'user mode (%0.3f ms) ' % (mTotal*1000)
 			devtl.html['timeline'] += html_device.format(name, \
-				title, left, top, '%d'%devtl.bodyH, width, '', '', '')
+				title, left, top, '%d'%devtl.bodyH, width, '', '', '', '')
 		# now draw the actual timeline blocks
 		for dir in phases:
 			# draw suspend and resume blocks separately
@@ -2776,15 +2796,14 @@ def createHTML(testruns):
 					xtraclass = ''
 					xtrainfo = ''
 					xtrastyle = ''
-					if 'htmlclass' in dev:
-						xtraclass = dev['htmlclass']
-						xtrainfo = dev['htmlclass']
 					if 'color' in dev:
 						xtrastyle = 'background-color:%s;' % dev['color']
 					if(d in sysvals.devprops):
 						name = sysvals.devprops[d].altName(d)
 						xtraclass = sysvals.devprops[d].xtraClass()
-						xtrainfo = sysvals.devprops[d].xtraInfo()
+						xtrainfo = ' info="' + sysvals.devprops[d].xtraInfo() + '"'
+					if 'htmlclass' in dev:
+						xtraclass = dev['htmlclass']
 					if('drv' in dev and dev['drv']):
 						drv = ' {%s}' % dev['drv']
 					if data.dmesg[b]['row'] < 1:
@@ -2796,8 +2815,8 @@ def createHTML(testruns):
 					width = '%f' % (((dev['end']-dev['start'])*100)/mTotal)
 					length = ' (%0.3f ms) ' % ((dev['end']-dev['start'])*1000)
 					devtl.html['timeline'] += html_device.format(dev['id'], \
-						name+drv+xtrainfo+length+b, left, top, '%.3f'%height, width, \
-						d+drv, xtraclass, xtrastyle)
+						name+drv+length+b, left, top, '%.3f'%height, width, \
+						d+drv, xtraclass, xtrastyle, xtrainfo)
 					if('traceevents' not in dev):
 						continue
 					# draw any trace events for this device
@@ -3166,6 +3185,9 @@ def addScriptCode(hf, testruns):
 	'		devinfo.style.display = "block";\n'\
 	'		var name = this.title.slice(0, this.title.indexOf(" ("));\n'\
 	'		var cpu = -1;\n'\
+	'		if(this.hasAttribute("info") && this.getAttribute("info")) {\n'\
+	'			console.log(this.getAttribute("info"));\n'\
+	'		}\n'\
 	'		if(name.match("CPU_ON\[[0-9]*\]"))\n'\
 	'			cpu = parseInt(name.slice(7));\n'\
 	'		else if(name.match("CPU_OFF\[[0-9]*\]"))\n'\
