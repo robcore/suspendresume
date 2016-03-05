@@ -69,6 +69,7 @@ class SystemValues:
 	mincglen = 1.0
 	srgap = 0
 	cgexp = False
+	graphbypid = False
 	outdir = ''
 	testdir = '.'
 	tpath = '/sys/kernel/debug/tracing/'
@@ -704,7 +705,7 @@ class Data:
 			list = self.dmesg[phase]['list']
 			for dev in list:
 				d = list[dev]
-				if(d['pid'] == pid and time >= d['start'] and
+				if(d['type'] >= 0 and d['pid'] == pid and time >= d['start'] and
 					time < d['end']):
 					return False
 		return True
@@ -732,7 +733,7 @@ class Data:
 			tgtdev = self.targetDevice(['suspend_machine', 'resume_machine'], start, end)
 		if not tgtdev:
 			if 'scsi_eh' in proc:
-				self.newActionGlobal(proc, start, end, pid)
+				self.newActionGlobal(proc, start, end, proc, pid, 1)
 				self.addDeviceFunctionCall(displayname, kprobename, proc, pid, start, end, cdata, rdata)
 			else:
 				vprint('IGNORE: %s[%s](%d) [%f - %f] | %s | %s | %s' % (displayname, kprobename,
@@ -814,7 +815,7 @@ class Data:
 		devid = '%s%d' % (self.idstr, self.html_device_id)
 		list = dict()
 		list[devname] = \
-			{'start': start, 'end': end, 'pid': 0, 'par': '',
+			{'start': start, 'end': end, 'proc': '', 'pid': 0, 'type': 1, 'par': '',
 			'length': (end-start), 'row': 0, 'id': devid, 'drv': '' };
 		self.dmesg[phasename] = \
 			{'list': list, 'start': start, 'end': end,
@@ -886,8 +887,8 @@ class Data:
 			list = self.dmesg[phase]['list']
 			rmlist = []
 			for name in list:
-				pid = list[name]['pid']
-				if(name not in filter and pid >= 0):
+				type = list[name]['type']
+				if(name not in filter and type >= 0):
 					rmlist.append(name)
 			for name in rmlist:
 				del list[name]
@@ -914,7 +915,7 @@ class Data:
 		for group in rmgroups:
 			self.devicegroups.remove(group)
 		self.devicegroups.append(newgroup)
-	def newActionGlobal(self, name, start, end, pid=-1, color=''):
+	def newActionGlobal(self, name, start, end, proc, pid, type=-1, color=''):
 		# if event starts before timeline start, expand timeline
 		if(start < self.start):
 			self.setStart(start)
@@ -937,16 +938,16 @@ class Data:
 					continue
 				targetphase = phase
 				overlap = o
-		if pid == -2:
+		if type == -2:
 			htmlclass = ' bg'
 		if len(phases) > 1:
 			htmlclass = ' bg'
 			self.phaseOverlap(phases)
 		if targetphase in self.phases:
-			newname = self.newAction(targetphase, name, pid, '', start, end, '', htmlclass, color)
+			newname = self.newAction(targetphase, name, proc, pid, type, '', start, end, '', htmlclass, color)
 			return (targetphase, newname)
 		return False
-	def newAction(self, phase, name, pid, parent, start, end, drv, htmlclass='', color=''):
+	def newAction(self, phase, name, proc, pid, type, parent, start, end, drv, htmlclass='', color=''):
 		# new device callback for a specific phase
 		self.html_device_id += 1
 		devid = '%s%d' % (self.idstr, self.html_device_id)
@@ -954,14 +955,15 @@ class Data:
 		length = -1.0
 		if(start >= 0 and end >= 0):
 			length = end - start
-		if pid == -2:
+		if type == -2:
 			i = 2
 			origname = name
 			while(name in list):
 				name = '%s[%d]' % (origname, i)
 				i += 1
-		list[name] = {'start': start, 'end': end, 'pid': pid, 'par': parent,
-					  'length': length, 'row': 0, 'id': devid, 'drv': drv }
+		list[name] = {'start': start, 'end': end, 'proc': proc, 'pid': pid,
+					  'type': type, 'par': parent, 'length': length, 'row': 0,
+					  'id': devid, 'drv': drv }
 		if htmlclass:
 			list[name]['htmlclass'] = htmlclass
 		if color:
@@ -1053,7 +1055,7 @@ class Data:
 		for phase in self.dmesg:
 			list = self.dmesg[phase]['list']
 			for dev in list:
-				if list[dev]['pid'] >= 0 and dev not in real:
+				if list[dev]['type'] >= 0 and dev not in real:
 					real.append(dev)
 		# list of top-most root devices
 		rootlist = []
@@ -1061,8 +1063,8 @@ class Data:
 			list = self.dmesg[phase]['list']
 			for dev in list:
 				pdev = list[dev]['par']
-				pid = list[dev]['pid']
-				if(pid < 0 or re.match('[0-9]*-[0-9]*\.[0-9]*[\.0-9]*\:[\.0-9]*$', pdev)):
+				type = list[dev]['type']
+				if(type < 0 or re.match('[0-9]*-[0-9]*\.[0-9]*[\.0-9]*\:[\.0-9]*$', pdev)):
 					continue
 				if pdev and pdev not in real and pdev not in rootlist:
 					rootlist.append(pdev)
@@ -1241,11 +1243,13 @@ class FTraceCallGraph:
 	invalid = False
 	depth = 0
 	pid = 0
-	def __init__(self, pid):
+	proc = ''
+	def __init__(self, proc, pid):
 		self.start = -1.0
 		self.end = -1.0
 		self.list = []
 		self.depth = 0
+		self.proc = proc
 		self.pid = pid
 	def addLine(self, line, debug=False):
 		# if this is already invalid, just leave
@@ -1357,7 +1361,7 @@ class FTraceCallGraph:
 			vprint('Too much data for '+id+\
 				' '+window+', ignoring this callback')
 	def slice(self, t0, tN):
-		minicg = FTraceCallGraph(0)
+		minicg = FTraceCallGraph(0, '')
 		count = -1
 		firstdepth = 0
 		for l in self.list:
@@ -1387,6 +1391,7 @@ class FTraceCallGraph:
 			if fixed:
 				self.end = last.time
 				return True
+		self.invalid = True
 		return False
 	def postProcess(self, debug=False):
 		stack = dict()
@@ -1400,6 +1405,7 @@ class FTraceCallGraph:
 					if debug:
 						print 'Post Process Error: Depth missing'
 						l.debugPrint()
+					self.invalid = True
 					return False
 				# transfer total time from return line to call line
 				stack[l.depth].length = l.length
@@ -1412,10 +1418,11 @@ class FTraceCallGraph:
 		elif(cnt < 0):
 			if debug:
 				print 'Post Process Error: Depth is less than 0'
+			self.invalid = True
 			return False
 		# trace ended before call tree finished
 		return self.repair(cnt)
-	def deviceMatch(self, pid, data):
+	def deviceMatch(self, proc, pid, data):
 		found = False
 		# add the callgraph data to the device hierarchy
 		borderphase = {
@@ -1427,7 +1434,8 @@ class FTraceCallGraph:
 			list = data.dmesg[p]['list']
 			for devname in list:
 				dev = list[devname]
-				if(pid == dev['pid'] and
+				if(proc == dev['proc'] and
+					pid == dev['pid'] and
 					self.start <= dev['start'] and
 					self.end >= dev['end']):
 					dev['ftrace'] = self.slice(dev['start'], dev['end'])
@@ -1439,7 +1447,8 @@ class FTraceCallGraph:
 				list = data.dmesg[p]['list']
 				for devname in list:
 					dev = list[devname]
-					if(pid == dev['pid'] and
+					if(proc == dev['proc'] and
+						pid == dev['pid'] and
 						self.start <= dev['start'] and
 						self.end >= dev['end']):
 						dev['ftrace'] = self
@@ -1463,7 +1472,7 @@ class FTraceCallGraph:
 				break
 		if not phase:
 			return
-		out = data.newActionGlobal(name, fs, fe, -2)
+		out = data.newActionGlobal(name, fs, fe, self.proc, self.pid, -2)
 		if out:
 			phase, myname = out
 			data.dmesg[phase]['list'][myname]['ftrace'] = self
@@ -1579,7 +1588,7 @@ class Timeline:
 		orderedlist = []
 		for item in lenlist:
 			dev = dmesg[item[0]]['list'][item[1]]
-			if dev['pid'] == -2:
+			if dev['type'] == -2:
 				orderedlist.append(item)
 		for item in lenlist:
 			if item not in orderedlist:
@@ -1872,6 +1881,7 @@ def appendIncompleteTraceLog(testruns):
 			continue
 		# gather the basic message data from the line
 		m_time = m.group('time')
+		m_proc = m.group('proc')
 		m_pid = m.group('pid')
 		m_msg = m.group('msg')
 		if(tp.cgformat):
@@ -1979,7 +1989,7 @@ def appendIncompleteTraceLog(testruns):
 				if(name not in testrun[testidx].ttemp):
 					testrun[testidx].ttemp[name] = []
 				testrun[testidx].ttemp[name].append(\
-					{'begin': t.time, 'end': t.time})
+					{'begin': t.time, 'end': t.time, 'proc': m_proc, 'pid': pid})
 			else:
 				# finish off matching trace event in ttemp
 				if(name in testrun[testidx].ttemp):
@@ -1989,11 +1999,11 @@ def appendIncompleteTraceLog(testruns):
 			# create a callgraph object for the data
 			if(pid not in testrun[testidx].ftemp):
 				testrun[testidx].ftemp[pid] = []
-				testrun[testidx].ftemp[pid].append(FTraceCallGraph(pid))
+				testrun[testidx].ftemp[pid].append(FTraceCallGraph(m_proc, pid))
 			# when the call is finished, see which device matches it
 			cg = testrun[testidx].ftemp[pid][-1]
 			if(cg.addLine(t)):
-				testrun[testidx].ftemp[pid].append(FTraceCallGraph(pid))
+				testrun[testidx].ftemp[pid].append(FTraceCallGraph(m_proc, pid))
 	tf.close()
 
 	for test in testrun:
@@ -2001,7 +2011,8 @@ def appendIncompleteTraceLog(testruns):
 		if(sysvals.usetraceevents):
 			for name in test.ttemp:
 				for event in test.ttemp[name]:
-					test.data.newActionGlobal(name, event['begin'], event['end'])
+					test.data.newActionGlobal(name, event['begin'], \
+						event['end'], event['proc'], event['pid'], -1)
 
 		# add the callgraph data to the device hierarchy
 		for pid in test.ftemp:
@@ -2245,7 +2256,7 @@ def parseTraceLog():
 				if(isbegin):
 					# create a new list entry
 					testrun.ttemp[name].append(\
-						{'begin': t.time, 'end': t.time, 'pid': pid})
+						{'begin': t.time, 'end': t.time, 'proc': m_proc, 'pid': pid})
 				else:
 					if(len(testrun.ttemp[name]) > 0):
 						# if an entry exists, assume this is its end
@@ -2254,7 +2265,9 @@ def parseTraceLog():
 						# post resume events can just have ends
 						testrun.ttemp[name].append({
 							'begin': data.dmesg[phase]['start'],
-							'end': t.time})
+							'end': t.time,
+							'proc': m_proc,
+							'pid': pid})
 			# device callback start
 			elif(t.type == 'device_pm_callback_start'):
 				m = re.match('(?P<drv>.*) (?P<d>.*), parent: *(?P<p>.*), .*',\
@@ -2265,7 +2278,7 @@ def parseTraceLog():
 				n = m.group('d')
 				p = m.group('p')
 				if(n and p):
-					data.newAction(phase, n, pid, p, t.time, -1, drv)
+					data.newAction(phase, n, m_proc, pid, 1, p, t.time, -1, drv)
 			# device callback finish
 			elif(t.type == 'device_pm_callback_end'):
 				m = re.match('(?P<drv>.*) (?P<d>.*), err.*', t.name);
@@ -2308,69 +2321,21 @@ def parseTraceLog():
 					e['end'] = t.time
 					e['rdata'] = kprobedata
 		# callgraph processing
-		elif sysvals.usecallgraph:
+		elif sysvals.usecallgraph or sysvals.suspendmode == 'command':
 			# create a callgraph object for the data
 			key = (m_proc, pid)
 			if(key not in testrun.ftemp):
 				testrun.ftemp[key] = []
-				testrun.ftemp[key].append(FTraceCallGraph(pid))
+				testrun.ftemp[key].append(FTraceCallGraph(m_proc, pid))
 			# when the call is finished, see which device matches it
 			cg = testrun.ftemp[key][-1]
 			if(cg.addLine(t)):
-				testrun.ftemp[key].append(FTraceCallGraph(pid))
+				testrun.ftemp[key].append(FTraceCallGraph(m_proc, pid))
 	tf.close()
 
-	if sysvals.suspendmode == 'command':
+	# handle post processing on the callgraph data
+	if sysvals.usecallgraph or sysvals.suspendmode == 'command':
 		for test in testruns:
-			for p in test.data.phases:
-				if p == 'resume_complete':
-					test.data.dmesg[p]['start'] = test.data.start
-					test.data.dmesg[p]['end'] = test.data.end
-				else:
-					test.data.dmesg[p]['start'] = test.data.start
-					test.data.dmesg[p]['end'] = test.data.start
-			test.data.tSuspended = test.data.start
-			test.data.tResumed = test.data.start
-			test.data.tLow = 0
-			test.data.fwValid = False
-
-	for test in testruns:
-		# add the traceevent data to the device hierarchy
-		if(sysvals.usetraceevents):
-			# add actual trace funcs
-			for name in test.ttemp:
-				for event in test.ttemp[name]:
-					test.data.newActionGlobal(name, event['begin'], event['end'], event['pid'])
-			# add the kprobe based virtual tracefuncs as actual devices
-			for key in tp.ktemp:
-				name, pid = key
-				if name not in sysvals.tracefuncs:
-					continue
-				for e in tp.ktemp[key]:
-					kb, ke = e['begin'], e['end']
-					if kb == ke or not test.data.isInsideTimeline(kb, ke):
-						continue
-					test.data.newActionGlobal(e['name'], kb, ke, pid)
-			# add config base kprobes and dev kprobes
-			for key in tp.ktemp:
-				name, pid = key
-				if name in sysvals.tracefuncs:
-					continue
-				for e in tp.ktemp[key]:
-					kb, ke = e['begin'], e['end']
-					if kb == ke or not test.data.isInsideTimeline(kb, ke):
-						continue
-					color = sysvals.kprobeColor(e['name'])
-					if name not in sysvals.dev_tracefuncs:
-						# config base kprobe
-						test.data.newActionGlobal(e['name'], kb, ke, -2, color)
-					elif sysvals.usedevsrc:
-						# dev kprobe
-						data.addDeviceFunctionCall(e['name'], name, e['proc'], pid, kb,
-							ke, e['cdata'], e['rdata'])
-		if sysvals.usecallgraph:
-			# add the callgraph data to the device hierarchy
-			sortlist = dict()
 			for key in test.ftemp:
 				proc, pid = key
 				for cg in test.ftemp[key]:
@@ -2381,8 +2346,66 @@ def parseTraceLog():
 						vprint('Sanity check failed for '+\
 							id+', ignoring this callback')
 						continue
+
+	if sysvals.suspendmode == 'command':
+		for data in testdata:
+			for p in data.phases:
+				if p == 'resume_complete':
+					data.dmesg[p]['start'] = data.start
+					data.dmesg[p]['end'] = data.end
+				else:
+					data.dmesg[p]['start'] = data.start
+					data.dmesg[p]['end'] = data.start
+			data.tSuspended = data.start
+			data.tResumed = data.start
+			data.tLow = 0
+			data.fwValid = False
+
+	for test in testruns:
+		# add the traceevent data to the device hierarchy
+		if(sysvals.usetraceevents):
+			# add actual trace funcs
+			for name in test.ttemp:
+				for event in test.ttemp[name]:
+					test.data.newActionGlobal(name, event['begin'], \
+						event['end'], event['proc'], event['pid'], -1)
+			# add the kprobe based virtual tracefuncs as actual devices
+			for key in tp.ktemp:
+				name, pid = key
+				if name not in sysvals.tracefuncs:
+					continue
+				for e in tp.ktemp[key]:
+					kb, ke, proc = e['begin'], e['end'], e['proc']
+					if kb == ke or not test.data.isInsideTimeline(kb, ke):
+						continue
+					test.data.newActionGlobal(e['name'], kb, ke, proc, pid, 1)
+			# add config base kprobes and dev kprobes
+			for key in tp.ktemp:
+				name, pid = key
+				if name in sysvals.tracefuncs:
+					continue
+				for e in tp.ktemp[key]:
+					kb, ke, proc = e['begin'], e['end'], e['proc']
+					if kb == ke or not test.data.isInsideTimeline(kb, ke):
+						continue
+					color = sysvals.kprobeColor(e['name'])
+					if name not in sysvals.dev_tracefuncs:
+						# config base kprobe
+						test.data.newActionGlobal(e['name'], kb, ke, proc, pid, -2, color)
+					elif sysvals.usedevsrc:
+						# dev kprobe
+						data.addDeviceFunctionCall(e['name'], name, e['proc'], pid, kb,
+							ke, e['cdata'], e['rdata'])
+		if sysvals.usecallgraph or sysvals.suspendmode == 'command':
+			# add the callgraph data to the device hierarchy
+			sortlist = dict()
+			for key in test.ftemp:
+				proc, pid = key
+				for cg in test.ftemp[key]:
+					if len(cg.list) < 1 or cg.invalid:
+						continue
 					# match cg data to devices
-					if sysvals.suspendmode == 'command' or not cg.deviceMatch(pid, test.data):
+					if sysvals.suspendmode == 'command' or not cg.deviceMatch(proc, pid, test.data):
 						sortkey = '%f%f%d' % (cg.start, cg.end, pid)
 						sortlist[sortkey] = cg
 			# create blocks for orphan cg data
@@ -2722,7 +2745,7 @@ def parseKernelLog(data):
 				n = sm.group('n')
 				p = sm.group('p')
 				if(f and n and p):
-					data.newAction(phase, f, int(n), p, ktime, -1, '')
+					data.newAction(phase, f, '', int(n), 1, p, ktime, -1, '')
 			# device init return
 			elif(re.match('call (?P<f>.*)\+ returned .* after '+\
 				'(?P<t>.*) usecs', msg)):
@@ -2794,7 +2817,7 @@ def parseKernelLog(data):
 	# fill in any actions we've found
 	for name in actions:
 		for event in actions[name]:
-			data.newActionGlobal(name, event['begin'], event['end'])
+			data.newActionGlobal(name, event['begin'], event['end'], '', 0, -1)
 
 	if(sysvals.verbose):
 		data.printDetails()
@@ -4512,6 +4535,8 @@ def configFromFile(file):
 					sysvals.debugfuncs.append(i.strip())
 			elif(opt.lower() == 'expandcg'):
 				sysvals.cgexp = checkArgBool(value)
+			elif(opt.lower() == 'graphbypid'):
+				sysvals.graphbypid = checkArgBool(value)
 			elif(opt.lower() == 'srgap'):
 				if checkArgBool(value):
 					sysvals.srgap = 5
@@ -4657,6 +4682,7 @@ def printHelp():
 	print('    -multi n d  Execute <n> consecutive tests at <d> seconds intervals. The outputs will')
 	print('                be created in a new subdirectory with a summary page.')
 	print('    -srgap      Add a visible gap in the timeline between sus/res (default: disabled)')
+#	print('    -graphbypid Organize the timeline by process/thread id (default: disabled)')
 	print('    -cmd {s}    Instead of suspend/resume, run a command, e.g. "sync -d"')
 	print('    -mindev ms  Discard all device blocks shorter than ms milliseconds (e.g. 0.001 for us)')
 	print('    -mincg  ms  Discard all callgraphs shorter than ms milliseconds (e.g. 0.001 for us)')
@@ -4750,6 +4776,8 @@ if __name__ == '__main__':
 			sysvals.suspendmode = 'command'
 		elif(arg == '-expandcg'):
 			sysvals.cgexp = True
+		elif(arg == '-graphbypid'):
+			sysvals.graphbypid = True
 		elif(arg == '-srgap'):
 			sysvals.srgap = 5
 		elif(arg == '-multi'):
