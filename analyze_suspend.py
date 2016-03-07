@@ -1554,51 +1554,24 @@ class Timeline:
 					remaining -= 1
 			row += 1
 		return row
-	# Function: getPhaseRows
+	# Function: getProcessRows
 	# Description:
-	#	 Organize the timeline entries into the smallest
-	#	 number of rows possible, with no entry overlapping
+	#	 layout a set of devices for a single process on separate rows
 	# Arguments:
-	#	 list: the list of devices/actions for a single phase
-	#	 devlist: string list of device names to use
+	#	 dmesg: the test data to use
+	#	 myphases: the list of phases we're targetting
+	#	 devlist: string list of phase/device name pairs to use
+	#	 row: the starting row to begin placement
 	# Output:
-	#	 The total number of rows needed to display this phase of the timeline
-	def getPhaseRows(self, dmesg, devlist):
-		# clear all rows and set them to undefined
+	#	 The last row we placed devices on
+	def getProcessRows(self, dmesg, myphases, devlist, row):
 		remaining = len(devlist)
 		rowdata = dict()
-		row = 0
-		lendict = dict()
-		myphases = []
-		for item in devlist:
-			if item[0] not in self.phases:
-				self.phases.append(item[0])
-			if item[0] not in myphases:
-				myphases.append(item[0])
-				self.rowmaxlines[item[0]] = dict()
-				self.rowheight[item[0]] = dict()
-			dev = dmesg[item[0]]['list'][item[1]]
-			dev['row'] = -1
-			lendict[item] = float(dev['end']) - float(dev['start'])
-			if 'src' in dev:
-				dev['devrows'] = self.getDeviceRows(dev['src'])
-		lenlist = []
-		for i in sorted(lendict, key=lendict.get, reverse=True):
-			lenlist.append(i)
-		orderedlist = []
-		for item in lenlist:
-			dev = dmesg[item[0]]['list'][item[1]]
-			if dev['type'] == -2:
-				orderedlist.append(item)
-		for item in lenlist:
-			if item not in orderedlist:
-				orderedlist.append(item)
-		# try to pack each row with as many ranges as possible
 		while(remaining > 0):
 			rowheight = 1
 			if(row not in rowdata):
 				rowdata[row] = []
-			for item in orderedlist:
+			for item in devlist:
 				dev = dmesg[item[0]]['list'][item[1]]
 				if(dev['row'] < 0):
 					s = dev['start']
@@ -1621,6 +1594,60 @@ class Timeline:
 				self.rowmaxlines[phase][row] = rowheight
 				self.rowheight[phase][row] = rowheight * self.rowH
 			row += 1
+		return row
+	# Function: getPhaseRows
+	# Description:
+	#	 Organize the timeline entries into the smallest
+	#	 number of rows possible, with no entry overlapping
+	# Arguments:
+	#	 dmesg: the test data to use
+	#	 devlist: string list of phase/device name pairs to use
+	#	 graphbypid: if true, separate the processes onto seprate rows
+	# Output:
+	#	 The total number of rows needed to display this phase of the timeline
+	def getPhaseRows(self, dmesg, devlist, graphbypid):
+		# clear all rows and set them to undefined
+		lendict = dict()
+		myphases = []
+		# initialize the lists and add any src rows for each dev
+		for item in devlist:
+			if item[0] not in self.phases:
+				self.phases.append(item[0])
+			if item[0] not in myphases:
+				myphases.append(item[0])
+				self.rowmaxlines[item[0]] = dict()
+				self.rowheight[item[0]] = dict()
+			dev = dmesg[item[0]]['list'][item[1]]
+			dev['row'] = -1
+			lendict[item] = float(dev['end']) - float(dev['start'])
+			if 'src' in dev:
+				dev['devrows'] = self.getDeviceRows(dev['src'])
+		# sort the dev list by length, putting kprobe devs first
+		lenlist = []
+		for i in sorted(lendict, key=lendict.get, reverse=True):
+			lenlist.append(i)
+		orderedlist = []
+		for item in lenlist:
+			dev = dmesg[item[0]]['list'][item[1]]
+			if dev['type'] == -2:
+				orderedlist.append(item)
+		for item in lenlist:
+			if item not in orderedlist:
+				orderedlist.append(item)
+		# try to pack each row with as many ranges as possible
+		if not graphbypid:
+			row = self.getProcessRows(dmesg, myphases, orderedlist, 0)
+		else:
+			procdict = dict()
+			for item in orderedlist:
+				dev = dmesg[item[0]]['list'][item[1]]
+				procname = '%s-%d' % (dev['proc'], dev['pid'])
+				if procname not in procdict:
+					procdict[procname] = []
+				procdict[procname].append(item)
+			row = 0
+			for procname in procdict:
+				row = self.getProcessRows(dmesg, myphases, procdict[procname], row)
 		if(row > self.rows):
 			self.rows = int(row)
 		for phase in myphases:
@@ -3114,7 +3141,7 @@ def createHTML(testruns):
 	tSuspended = testruns[-1].tSuspended
 	tTotal = tMax - t0
 
-	# determine the maximum number of rows we need to draw
+	# calculate the row layout for all devices
 	for data in testruns:
 		data.selectTimelineDevices('%f', tTotal, sysvals.mindevlen)
 		for group in data.devicegroups:
@@ -3122,7 +3149,7 @@ def createHTML(testruns):
 			for phase in group:
 				for devname in data.tdevlist[phase]:
 					devlist.append((phase,devname))
-			devtl.getPhaseRows(data.dmesg, devlist)
+			devtl.getPhaseRows(data.dmesg, devlist, sysvals.graphbypid)
 	devtl.calcTotalRows()
 
 	# create bounding box, add buttons
@@ -3209,8 +3236,9 @@ def createHTML(testruns):
 					left = '%f' % (((dev['start']-m0)*100)/mTotal)
 					width = '%f' % (((dev['end']-dev['start'])*100)/mTotal)
 					length = ' (%0.3f ms) ' % ((dev['end']-dev['start'])*1000)
+					procname = ' %s-%d' % (dev['proc'], dev['pid'])
 					if sysvals.suspendmode == 'command':
-						title = name+drv+xtrainfo+length+'cmdexec'
+						title = name+drv+xtrainfo+length+procname
 					else:
 						title = name+drv+xtrainfo+length+b
 					devtl.html['timeline'] += html_device.format(dev['id'], \
@@ -4682,7 +4710,7 @@ def printHelp():
 	print('    -multi n d  Execute <n> consecutive tests at <d> seconds intervals. The outputs will')
 	print('                be created in a new subdirectory with a summary page.')
 	print('    -srgap      Add a visible gap in the timeline between sus/res (default: disabled)')
-#	print('    -graphbypid Organize the timeline by process/thread id (default: disabled)')
+	print('    -graphbypid Organize the timeline by process/thread id (default: disabled)')
 	print('    -cmd {s}    Instead of suspend/resume, run a command, e.g. "sync -d"')
 	print('    -mindev ms  Discard all device blocks shorter than ms milliseconds (e.g. 0.001 for us)')
 	print('    -mincg  ms  Discard all callgraphs shorter than ms milliseconds (e.g. 0.001 for us)')
