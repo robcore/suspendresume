@@ -169,6 +169,14 @@ class SystemValues:
 		'intel_hdmi_detect': dict(),
 		'intel_opregion_init': dict(),
 	}
+	callgraph_ignore = [
+		'exit_to_usermode_loop',
+		'schedule',
+		'schedule_timeout',
+		'poll_schedule_timeout',
+		'kthread_parkme',
+		'__refrigerator',
+	]
 	kprobes_postresume = [
 		{
 			'name': 'ataportrst',
@@ -467,6 +475,8 @@ class SystemValues:
 		for name in self.dev_tracefuncs:
 			self.defaultKprobe(name, self.dev_tracefuncs[name])
 	def isCallgraphFunc(self, name):
+		if name in self.callgraph_ignore:
+			return False
 		if len(self.debugfuncs) < 1 and self.suspendmode == 'command':
 			return True
 		if name in self.debugfuncs:
@@ -1080,6 +1090,8 @@ class Data:
 			devlist = []
 			list = self.dmesg[phase]['list']
 			for dev in list:
+				if list[dev]['proc'] == '<idle>' or list[dev]['proc'] == 'migrati':
+					continue
 				length = (list[dev]['end'] - list[dev]['start']) * 1000
 				width = widfmt % (((list[dev]['end']-list[dev]['start'])*100)/tTotal)
 				if width != '0.000000' and length >= mindevlen:
@@ -2375,18 +2387,26 @@ def parseTraceLog():
 						continue
 
 	if sysvals.suspendmode == 'command':
+		# test if the command run was over a suspend/resume
+		nosuspend = False
 		for data in testdata:
 			for p in data.phases:
-				if p == 'resume_complete':
-					data.dmesg[p]['start'] = data.start
-					data.dmesg[p]['end'] = data.end
-				else:
-					data.dmesg[p]['start'] = data.start
-					data.dmesg[p]['end'] = data.start
-			data.tSuspended = data.start
-			data.tResumed = data.start
-			data.tLow = 0
-			data.fwValid = False
+				if(data.dmesg[p]['start'] < 0 or data.dmesg[p]['end'] < 0):
+					nosuspend = True
+		# if this data is not over suspend, blank out all but resume complete
+		if nosuspend:
+			for data in testdata:
+				for p in data.phases:
+					if p == 'resume_complete':
+						data.dmesg[p]['start'] = data.start
+						data.dmesg[p]['end'] = data.end
+					else:
+						data.dmesg[p]['start'] = data.start
+						data.dmesg[p]['end'] = data.start
+				data.tSuspended = data.start
+				data.tResumed = data.start
+				data.tLow = 0
+				data.fwValid = False
 
 	for test in testruns:
 		# add the traceevent data to the device hierarchy
@@ -3144,12 +3164,20 @@ def createHTML(testruns):
 	# calculate the row layout for all devices
 	for data in testruns:
 		data.selectTimelineDevices('%f', tTotal, sysvals.mindevlen)
-		for group in data.devicegroups:
+		if not sysvals.graphbypid:
+			for group in data.devicegroups:
+				devlist = []
+				for phase in group:
+					for devname in data.tdevlist[phase]:
+						devlist.append((phase,devname))
+				devtl.getPhaseRows(data.dmesg, devlist, False)
+		else:
 			devlist = []
-			for phase in group:
+			for phase in data.phases:
 				for devname in data.tdevlist[phase]:
 					devlist.append((phase,devname))
-			devtl.getPhaseRows(data.dmesg, devlist, sysvals.graphbypid)
+			devtl.getPhaseRows(data.dmesg, devlist, True)
+
 	devtl.calcTotalRows()
 
 	# create bounding box, add buttons
@@ -3238,7 +3266,7 @@ def createHTML(testruns):
 					length = ' (%0.3f ms) ' % ((dev['end']-dev['start'])*1000)
 					procname = ' %s-%d' % (dev['proc'], dev['pid'])
 					if sysvals.suspendmode == 'command':
-						title = name+drv+xtrainfo+length+procname
+						title = name+drv+xtrainfo+length+'cmdexec'
 					else:
 						title = name+drv+xtrainfo+length+b
 					devtl.html['timeline'] += html_device.format(dev['id'], \
